@@ -1,6 +1,6 @@
 # OpenAPI 契约兼容性审计 API
 
-用 Python + FastAPI 实现的 OpenAPI 3.x 契约服务，提供八个接口：
+用 Python + FastAPI 实现的 OpenAPI 3.x 契约服务，提供九个接口：
 
 - **`POST /audit`**：提交**基线版**与**候选版**两份 OpenAPI 3.x JSON 文档，服务会解析本地 `$ref`（循环安全），并按以下策略判定候选版是否向后兼容：
 
@@ -72,6 +72,20 @@
   **来源 JSON Pointer**。**没有任何可满足项仍返回 200**，逐项列出缺少的方案或 scope；
   悬空 / 外部 / 循环引用、未定义方案名与非法定义返回 **422**，错误均不包含秘密值。
 
+- **`POST /links/plan`**：为 OpenAPI Link 描述的**后续调用**生成计划。提交**一份**
+  OpenAPI 3.x 文档、源操作选择器（`METHOD /path`）、Link 名称与一次实际请求 / 响应
+  上下文（`context.response.statusCode` 必提供）。服务按 **精确状态码 → `nXX` 类通配
+  （大小写不敏感）→ `default`** 的顺序选出声明该 Link 的 Response；Response、Link 与
+  目标 Path Item 的本地 `$ref` 均**循环安全**解析（OpenAPI 3.1 合并 `$ref` 同级字段、
+  3.0 忽略同级）。目标必须由**本地 `operationRef`**（`#/...`，末段为 HTTP 方法）与
+  **全局唯一 `operationId`** **二选一**指定。`parameters` 的键按**目标参数名**匹配
+  （同一名字出现在多个位置即歧义 422）；`parameters` 与 `requestBody` 的映射值以 `$`
+  开头时按**完整 Runtime Expression** 求值（与回调 URL 不同，body/path/query 结果
+  **允许是对象或数组**），其余 JSON 值为字面常量。返回目标操作、按
+  path/query/header/cookie 分组的参数值、请求体以及每个映射的**来源 JSON Pointer**。
+  表达式缺值、目标 / 参数无效或未知、必填参数未赋值、外部 / 悬空 / 循环引用一律
+  **422**；不产生半成品、不修改输入。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件）。在项目根目录执行：
@@ -93,6 +107,7 @@ docker compose up --build
 | 请求物化接口 | `POST http://localhost:8080/requests/materialize` |
 | 回调解析接口 | `POST http://localhost:8080/callbacks/resolve` |
 | 安全方案规划接口 | `POST http://localhost:8080/security/plan` |
+| Link 后续调用计划接口 | `POST http://localhost:8080/links/plan` |
 | 交互式 API 文档（Swagger UI） | http://localhost:8080/docs |
 | OpenAPI 描述文档 | http://localhost:8080/openapi.json |
 
@@ -1137,6 +1152,214 @@ curl -s -X POST http://localhost:8080/security/plan \
 > 会被访问，因而不影响本次规划。规划过程**不会修改**请求中的任何对象，输出与输入键序、
 > scope 顺序无关。
 
+## `POST /links/plan`：按 Link 生成后续调用计划
+
+用于**联调时顺着响应里的 Link 直接构造下一跳请求**：给定一份 OpenAPI 3.x 文档、源操作
+选择器、一个 Link 名称与一次实际请求 / 响应上下文，服务定位该 Link 指向的目标操作，
+求值 `parameters` / `requestBody` 中的 Runtime Expression，并返回**目标操作、分组参数值、
+请求体及每个映射的来源 JSON Pointer**，可直接交给 `POST /requests/materialize` 完成
+线格式序列化。
+
+### Response 选择顺序
+
+服务取 `context.response.statusCode`（整数或字符串均可），在源操作的 `responses` 中按
+OpenAPI 规范顺序选择声明 Link 的 Response：
+
+1. **精确键**：如 `201` 精确匹配（字符串 `"201"` 与数字状态码等价匹配）；
+2. **类通配 `nXX`**：无精确键时按首位数字匹配 `2XX` / `4xx` 等，**大小写不敏感**；
+3. **`default`**：以上都没有时使用兜底响应。
+
+三者都不存在时返回 422；未提供 `context.response.statusCode` 同样 422（这是选出 Link
+所必需的运行时值）。
+
+### Response / Link / Path Item 的本地 `$ref`
+
+- Response（`responses/<key>`）、Link（`<response>/links/<name>`）条目本身都可以是本地
+  `$ref`（如 `#/components/responses/...`、`#/components/links/...`）；目标 Path Item 的
+  自身 `$ref`（OpenAPI 3.1 `components/pathItems`）同样跟随。三条链都**循环安全**
+  （记录已访问指针，成环即 422，另有 100 层链长上限）。
+- **OpenAPI 3.1**：`$ref` 同级字段逐层合并（近者优先），Link 的 `parameters` 等成员可被
+  同级字段覆盖；**OpenAPI 3.0**：严格遵循旧规范，`$ref` 同级字段被忽略。
+- 仅本地引用 `#/...` 受支持：外部引用、悬空指针、目标非对象均 422。Path Item / 参数
+  内部更深层的 `$ref`（如 schema 引用）不展开，因此正常的递归 schema 不会被误判为循环；
+  但**目标参数自身的 `$ref`** 会跟随解析（悬空 / 循环即 422），以便按键名匹配。
+
+### 目标定位：`operationRef` 与 `operationId` 二选一
+
+- **`operationRef`**：必须是**本地** JSON Pointer 片段（`#/...`），末段是 HTTP 方法
+  （get/put/post/delete/options/head/patch/trace），其上方节点为 Path Item（自身 `$ref`
+  会被解析）。片段遵循 RFC 6901 转义，例如 `#/paths/~1orders~1{orderId}/get`。外部 URI、
+  悬空指针、未指向操作、目标 Path Item 未声明该方法均 422。指向
+  `#/components/pathItems/...` 时目标没有具体 URL 路径，响应里 `target.path` /
+  `target.selector` 为 `null`。
+- **`operationId`**：必须在文档 `paths` 下**全局唯一**；零个匹配（未定义）或多个匹配
+  （重复 ID）都 422，错误中列出全部冲突位置。
+- 同时给出两者或两者都不给均 422。
+
+### `parameters` / `requestBody` 映射求值
+
+- `parameters` 是一个对象，**键是目标操作的参数名**（不是 `in.name` 限定形式）。服务合并
+  目标 Path Item 与操作两级参数（操作级按 `(in, name)` 覆盖路径级）后按键匹配：
+  - 键在目标参数中不存在 → `unknown_parameter` 422；
+  - 同名参数同时声明在**多个位置**（如同名的 header 与 query 参数）→
+    `ambiguous_parameter` 422；
+  - 目标的必填参数（path 参数恒为必填）未被任何映射赋值 →
+    `missing_required_parameter` 422。可选参数缺省即省略。
+- 映射值是**字符串且以 `$` 开头**时，必须是一个**完整的** Runtime Expression（支持
+  `$url` / `$method` / `$statusCode` / `$request.path.<n>` / `$request.query.<n>` /
+  `$request.header.<t>` / `$request.body[#/ptr]` / `$response.header.<t>` /
+  `$response.body[#/ptr]`，语法与 `/callbacks/resolve` 完全一致）：
+  - 与回调 URL 插值不同，Link 参数 / 请求体表达式的结果**允许是对象或数组**
+    （如整个响应体或 `$response.body#/items`）；只有 header 表达式仍需解析为标量；
+  - 取到 `null`、JSON Pointer 不可达、对应 message / 字段未提供 → `missing_value` 422；
+  - header 名大小写不敏感匹配，命中仅大小写不同的多个上下文键 →
+    `ambiguous_header` 422；
+  - 以 `$` 开头但不是合法完整表达式（如 `$nope`）→ `invalid_expression` 422。
+- 其余任意 JSON 值（含不以 `$` 开头的字符串，哪怕内含 `{...}`）都是**字面常量**，原样
+  深拷贝赋值。`requestBody` 省略时 `provided=false`、`value=null`。
+
+### 来源 JSON Pointer
+
+- `source.link_pointer`：Link 条目出现处（引用型 Link 指向 **`$ref` 出现处**）；
+- `response.pointer`：Response 条目出现处；`response.match` 为
+  `exact` / `wildcard` / `default`；
+- 每个参数值同时给出 `value_pointer`（映射值在 Link Object 中的位置；引用型 Link 跟随到
+  组件内的声明，3.1 覆盖处指向覆盖层）与 `parameter_pointer`（目标参数定义位置，参数
+  `$ref` 跟随到组件）；
+- `request_body.value_pointer` 指向 Link 的 `requestBody` 成员（省略时为 `null`）。
+
+### 请求
+
+```bash
+curl -s -X POST http://localhost:8080/links/plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "document": {
+      "openapi": "3.0.3",
+      "info": {"title": "Orders", "version": "1.0"},
+      "paths": {
+        "/orders": {"post": {"operationId": "createOrder", "responses": {
+          "201": {"description": "created", "links": {"getOrder": {
+            "operationId": "getOrder",
+            "parameters": {
+              "orderId": "$response.body#/id",
+              "trace": "$request.header.x-trace",
+              "verbose": true
+            },
+            "requestBody": "$response.body"
+          }}}
+        }}},
+        "/orders/{orderId}": {"get": {"operationId": "getOrder", "parameters": [
+          {"name": "orderId", "in": "path", "required": true, "schema": {"type": "string"}},
+          {"name": "trace", "in": "header", "schema": {"type": "string"}},
+          {"name": "verbose", "in": "query", "schema": {"type": "boolean"}}
+        ], "responses": {"200": {"description": "ok"}}}}
+      }
+    },
+    "selector": "POST /orders",
+    "link": "getOrder",
+    "context": {
+      "request": {"header": {"X-Trace": "t-1"}},
+      "response": {"statusCode": 201, "body": {"id": "ord-42", "total": 9}}
+    }
+  }'
+```
+
+- `document`：一份 OpenAPI 3.x JSON 文档（对象）。
+- `selector`：形如 `METHOD /path` 的源操作选择器（方法大小写不敏感，路径逐字匹配）。
+- `link`：所选 Response 的 `links` 成员名（非空字符串）。
+- `context`（可省略，默认为空对象）：与 `/callbacks/resolve` 相同的请求 / 响应信封；
+  `request` 与 `response` 各字段可选，但 `response.statusCode` 为选出 Response 所必需。
+
+### 成功响应（`200`）
+
+```json
+{
+  "source": {
+    "selector": "POST /orders",
+    "operation_pointer": "/paths/~1orders/post",
+    "link_name": "getOrder",
+    "link_pointer": "/paths/~1orders/post/responses/201/links/getOrder"
+  },
+  "response": {"status_code": 201, "key": "201", "match": "exact",
+               "pointer": "/paths/~1orders/post/responses/201"},
+  "target": {
+    "selector": "GET /orders/{orderId}",
+    "method": "get",
+    "path": "/orders/{orderId}",
+    "operation_pointer": "/paths/~1orders~1{orderId}/get",
+    "operation_id": "getOrder",
+    "operation_ref": null
+  },
+  "parameter_values": {
+    "path": [{"name": "orderId", "value": "ord-42",
+      "expression": "$response.body#/id",
+      "value_pointer": "/paths/~1orders/post/responses/201/links/getOrder/parameters/orderId",
+      "parameter_pointer": "/paths/~1orders~1{orderId}/get/parameters/0"}],
+    "query": [{"name": "verbose", "value": true, "expression": null,
+      "value_pointer": "/paths/~1orders/post/responses/201/links/getOrder/parameters/verbose",
+      "parameter_pointer": "/paths/~1orders~1{orderId}/get/parameters/2"}],
+    "header": [{"name": "trace", "value": "t-1",
+      "expression": "$request.header.x-trace",
+      "value_pointer": "/paths/~1orders/post/responses/201/links/getOrder/parameters/trace",
+      "parameter_pointer": "/paths/~1orders~1{orderId}/get/parameters/1"}],
+    "cookie": []
+  },
+  "request_body": {
+    "provided": true,
+    "value": {"id": "ord-42", "total": 9},
+    "expression": "$response.body",
+    "value_pointer": "/paths/~1orders/post/responses/201/links/getOrder/requestBody"
+  }
+}
+```
+
+- `parameter_values` 恒含 `path` / `query` / `header` / `cookie` 四组，无赋值时为 `[]`；
+  字面常量映射的 `expression` 为 `null`。
+- 输出值全部经过深拷贝，计划生成后再修改请求对象不会影响已返回的计划。
+
+### 错误响应
+
+- `400 invalid_openapi_document`：`document` 缺少 `openapi: 3.x` 或 `paths` 对象。
+- `400 invalid_selector`：选择器不是 `METHOD /path` 形态，或路径 / 方法不存在。
+- `400 invalid_link_request`：`link` 不是非空字符串，或 `context` 信封非法（未知
+  section / 字段、容器不是对象、`statusCode` 非整数或字符串、header 值非标量等）。
+- `422 link_planning_failed`：所有语义问题一次报齐并稳定排序，`errors` 每条至少带
+  `code`、`pointer`、`error`：
+
+| code | 触发情形 | pointer 指向 |
+| --- | --- | --- |
+| `missing_value` | 表达式取到 `null` / 指针不可达，或缺 statusCode、对应 message / 字段 | 映射值或 `/context/response/statusCode`（另附 `context_pointer`、`expression`） |
+| `invalid_expression` | 以 `$` 开头但不是合法完整表达式，或 header 表达式解析为非标量 | 映射值 |
+| `ambiguous_header` | header 名大小写不敏感匹配到多个仅大小写不同的上下文键 | 映射值 |
+| `unknown_link_target` | `operationId` 未定义 / 不唯一，或 `operationRef` 不指向存在的操作 | `operationId` / `operationRef` 成员 |
+| `ambiguous_parameter` | 映射键命中跨多个位置（path/query/header/cookie）声明的同名参数 | 映射键（或必填歧义参数定义处） |
+| `unknown_parameter` | 映射键不是目标操作声明的参数名 | 映射键 |
+| `missing_required_parameter` | 目标必填参数未被任何映射赋值 | 目标参数定义（另附 `in`、`name`） |
+| `invalid_link` | 缺 Response、未知 Link 名、Link 同时 / 均未给两种目标、`parameters` 不是对象、目标不是对象等 | 问题节点 |
+| `unresolvable_reference` | Response / Link / 目标 Path Item / 目标参数的本地 `$ref` 悬空、外部、目标非对象或循环 | `$ref` 出现处（另附 `ref`） |
+
+```json
+{
+  "error": "link_planning_failed",
+  "message": "the follow-up call could not be planned; fix the reported link target, expressions, parameters or references first",
+  "errors": [
+    {
+      "code": "missing_required_parameter",
+      "pointer": "/paths/~1orders~1{orderId}/get/parameters/0",
+      "in": "path",
+      "name": "orderId",
+      "error": "required path parameter 'orderId' is not assigned by the link 'parameters' map"
+    }
+  ]
+}
+```
+
+> 解析过程**不会修改**请求中的 `document` 与 `context`，发生任何 422 时都**不返回半成品**；
+> 同一 Link 内的全部独立错误会一次报齐并稳定排序。该接口只负责“赋值计划”，参数的
+> style / explode 线格式序列化请继续使用 `POST /requests/materialize`，两者的参数分组
+> 信封完全一致；Docker 与 Docker Compose 的启动方式保持不变。
+
 ## 检查的变更类别
 
 | category | 说明 | 判定为 breaking 的方向 |
@@ -1261,7 +1484,21 @@ http basic/bearer（含 bearerFormat）/其他 scheme、oauth2 与 openIdConnect
 `security` / requirement / scope 容器形态错误、多错误齐报稳定排序、
 无可满足项仍 200 且逐项列出缺失方案与 scope、400 文档 / 选择器 / granted 信封边界、
 3.1 path-level `$ref` 提供操作、路径 token 的 RFC 6901 转义、
-秘密值不回显（200 与 400）、请求对象不被修改、重复 scope 去重等共 440 个用例。
+秘密值不回显（200 与 400）、请求对象不被修改、重复 scope 去重；
+以及 `/links/plan` 的 Response 精确 / `nXX`（大小写不敏感）/ `default` 选择顺序
+（数字与字符串状态码）、缺 statusCode 与无匹配 Response 422、未知 Link 名、
+Response / Link 本地 `$ref`（多跳、3.1 同级覆盖与 3.0 忽略同级、组件来源 Pointer）、
+悬空 / 外部 / 非对象 / 循环引用（Response 与 Link 两条链）422、
+目标 Path Item 自身 `$ref` 与目标参数 `$ref` 解析、
+本地 `operationRef`（RFC 6901 转义、根引用、非方法末段、缺失方法、悬空 / 外部指针、
+指向 components Path Item 时 path 为 null）与 `operationId`（未定义 / 重复 / 唯一）定位、
+两者同给或均不给 422、path-level 与 operation-level 参数合并（后者覆盖、歧义检测）、
+映射键未知 / 跨位置同名歧义 / 必填未赋值 422、可选跨位置同名省略合法、
+Runtime Expression 映射（body/path/query 结构化值允许、header 标量与大小写不敏感、
+歧义 header、缺值 / null / 不可达、非法完整表达式、含花括号的非常量字面量、
+`$statusCode`）、字面常量（数字 / 对象 / 数组 / null）、`requestBody` 省略与缺值、
+400 文档 / 选择器 / Link 名 / context 信封边界、错误齐报稳定排序、
+输入不被修改与无半成品等共 503 个用例。
 
 ## 项目结构
 
@@ -1269,7 +1506,7 @@ http basic/bearer（含 bearerFormat）/其他 scheme、oauth2 与 openIdConnect
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py          # FastAPI 路由、请求/响应模型、输入校验（/audit、/slice、/compose、/examples/validate、/overlay/apply、/requests/materialize、/callbacks/resolve 与 /security/plan）
+│   ├── main.py          # FastAPI 路由、请求/响应模型、输入校验（/audit、/slice、/compose、/examples/validate、/overlay/apply、/requests/materialize、/callbacks/resolve、/security/plan 与 /links/plan）
 │   ├── audit.py         # 契约比较引擎（操作/参数/请求体/响应/schema）
 │   ├── slicer.py        # 最小子契约切片（选择器校验、security 继承、$ref 闭包重建、SHA-256）
 │   ├── composer.py      # 网关契约合成（前缀规范化、命名空间化、$ref 改写、冲突检测、来源映射）
@@ -1277,6 +1514,7 @@ http basic/bearer（含 bearerFormat）/其他 scheme、oauth2 与 openIdConnect
 │   ├── overlay.py       # 有序覆盖动作（受限 JSONPath 解析、命中冻结、递归合并/倒序删除、SHA-256）
 │   ├── materializer.py  # 请求物化（参数合并、循环安全 $ref、path/query/header/cookie 样式序列化、百分号编码）
 │   ├── callbacks.py     # 回调 URL 解析（Runtime Expression、JSON Pointer body 片段、循环安全 Callback/Path Item $ref）
+│   ├── linkplanner.py   # Link 后续调用计划（Response 精确/nXX/default 选择、Response/Link/Path Item 循环安全 $ref、operationRef/operationId 定位、参数与请求体表达式求值、来源 Pointer）
 │   ├── security.py      # 受保护操作鉴权规划（OR/AND security、方案 $ref 循环解析、apiKey/http/oauth2/openIdConnect 校验、注入位置与来源 Pointer）
 │   └── refresolver.py   # 本地 $ref 解析（RFC 6901 指针 + 循环检测）
 ├── tests/
@@ -1287,7 +1525,8 @@ http basic/bearer（含 bearerFormat）/其他 scheme、oauth2 与 openIdConnect
 │   ├── test_overlay_api.py
 │   ├── test_materialize_api.py
 │   ├── test_callbacks_api.py
-│   └── test_security_api.py
+│   ├── test_security_api.py
+│   └── test_links_api.py
 ├── Dockerfile           # 容器封装全部依赖，非 root 用户运行，含 HEALTHCHECK
 ├── docker-compose.yml   # 一条命令启动，映射 8080 端口
 ├── requirements.txt

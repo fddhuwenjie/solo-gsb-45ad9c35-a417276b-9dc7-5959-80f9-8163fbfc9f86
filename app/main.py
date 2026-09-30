@@ -31,6 +31,17 @@ from .examples import (
     InvalidExampleDocumentError,
     validate_document_examples,
 )
+from .linkplanner import (
+    InvalidDocumentError as InvalidLinkDocumentError,
+)
+from .linkplanner import (
+    InvalidLinkRequestError,
+    InvalidSelectorError as InvalidLinkSelectorError,
+)
+from .linkplanner import (
+    LinkPlanningError,
+    plan_link,
+)
 from .materializer import (
     InvalidDocumentError as InvalidMaterializeDocumentError,
 )
@@ -140,7 +151,20 @@ app = FastAPI(
         "credential is injected (header/query/cookie/Authorization) with "
         "source JSON Pointers; unsatisfiable operations still return 200 "
         "with every missing scheme/scope, while dangling/external "
-        "references and illegal definitions return 422."
+        "references and illegal definitions return 422. "
+        "POST /links/plan plans the follow-up call described by one Link "
+        "Object: the declaring response is selected by "
+        "context.response.statusCode in exact, 'nXX' wildcard then 'default' "
+        "order, Response/Link/target Path Item local $refs resolve "
+        "cycle-safe, and the target must be identified by exactly one of a "
+        "local operationRef or a globally unique operationId. Link "
+        "parameters keys match target parameter names (same name in several "
+        "locations is ambiguous); parameters and requestBody values starting "
+        "with '$' are evaluated as runtime expressions (structured values "
+        "allowed), others are constants. Missing values, invalid/unknown/"
+        "ambiguous targets or parameters, unset required parameters and "
+        "external/dangling/circular references return 422 with source JSON "
+        "Pointers; the input is never modified."
     ),
 )
 
@@ -390,6 +414,114 @@ class ResolvedCallbackModel(BaseModel):
         ),
     )
 
+class LinkPlanRequest(BaseModel):
+    document: Dict[str, Any] = Field(
+        ..., description="The OpenAPI 3.x JSON document declaring the link."
+    )
+    selector: str = Field(
+        ...,
+        description=(
+            "The source operation whose response declares the link, in the "
+            "'METHOD /path' form (e.g. 'POST /orders'); method is "
+            "case-insensitive."
+        ),
+    )
+    link: str = Field(
+        ...,
+        description=(
+            "The name of the Link Object inside the response selected for "
+            "context.response.statusCode (exact code, then 'nXX', then "
+            "'default')."
+        ),
+    )
+    context: Dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "The concrete request/response context the link expressions are "
+            "evaluated against. Same envelope as /callbacks/resolve: "
+            "'request' (url, method, path, query, header, body) and "
+            "'response' (statusCode, header, body); every member is "
+            "optional except response.statusCode, which selects the "
+            "declaring response."
+        ),
+    )
+
+
+class LinkParameterValueModel(BaseModel):
+    name: str = Field(..., description="The declared target parameter name.")
+    value: Any = Field(..., description="The mapped value (literal or evaluated).")
+    expression: Optional[str] = Field(
+        ...,
+        description=(
+            "The original runtime expression when the mapping value was one; "
+            "null for a literal constant."
+        ),
+    )
+    value_pointer: str = Field(
+        ...,
+        description="JSON Pointer of the mapping value in the Link Object.",
+    )
+    parameter_pointer: str = Field(
+        ..., description="JSON Pointer of the target parameter definition.",
+    )
+
+
+class LinkTargetModel(BaseModel):
+    selector: Optional[str] = Field(
+        ...,
+        description=(
+            "The target operation as 'METHOD /path'; null when an "
+            "operationRef points at a reusable components Path Item without "
+            "a concrete URL path."
+        ),
+    )
+    method: str
+    path: Optional[str]
+    operation_pointer: str = Field(
+        ..., description="JSON Pointer of the resolved target operation."
+    )
+    operation_id: Optional[str] = Field(
+        ..., description="The resolved operationId, when the link used one."
+    )
+    operation_ref: Optional[str] = Field(
+        ..., description="The resolved local operationRef, when used."
+    )
+
+
+class LinkPlanResponse(BaseModel):
+    source: Dict[str, Any] = Field(
+        ...,
+        description=(
+            "Source selector/operation pointer plus the selected link name "
+            "and the JSON Pointer of its occurrence in the document."
+        ),
+    )
+    response: Dict[str, Any] = Field(
+        ...,
+        description=(
+            "The response that declared the link: runtime status code, the "
+            "matched response key, the match kind (exact/wildcard/default) "
+            "and the response object's JSON Pointer."
+        ),
+    )
+    target: LinkTargetModel
+    parameter_values: Dict[str, List[LinkParameterValueModel]] = Field(
+        ...,
+        description=(
+            "Mapped values grouped by parameter location ('path', 'query', "
+            "'header', 'cookie'); groups without assignments are empty lists."
+        ),
+    )
+    request_body: Dict[str, Any] = Field(
+        ...,
+        description=(
+            "Whether the link carries a requestBody, its evaluated value "
+            "(null when omitted), the source expression when applicable and "
+            "the value's JSON Pointer (null when omitted)."
+        ),
+    )
+
+
 class SecurityPlanRequest(BaseModel):
     document: Dict[str, Any] = Field(
         ..., description="The OpenAPI 3.x JSON document declaring the operation."
@@ -630,6 +762,7 @@ def root() -> Dict[str, str]:
         "requests_materialize": "POST /requests/materialize",
         "callbacks_resolve": "POST /callbacks/resolve",
         "security_plan": "POST /security/plan",
+        "links_plan": "POST /links/plan",
     }
 
 
@@ -1103,6 +1236,69 @@ def security_plan(payload: SecurityPlanRequest) -> JSONResponse:
                     "dangling, external or circular security scheme "
                     "definitions; fix the contract before a plan can be "
                     "produced"
+                ),
+                "errors": exc.errors,
+            },
+        )
+    return JSONResponse(status_code=200, content=result)
+
+
+@app.post(
+    "/links/plan",
+    response_model=LinkPlanResponse,
+    responses={
+        400: {
+            "description": "The document is not OpenAPI 3.x, the selector "
+            "is malformed/unknown, or the link name/context envelope is "
+            "malformed"
+        },
+        422: {
+            "description": "The response/link/target cannot be resolved: "
+            "missing status code or response, unknown link, malformed/"
+            "external/dangling/circular $ref or operationRef, duplicate/"
+            "missing operationId, unknown or cross-location-ambiguous "
+            "parameter key, expression without a value, or a required "
+            "parameter left unassigned; each error carries source JSON "
+            "Pointers"
+        },
+    },
+    summary="Plan the follow-up HTTP call described by one OpenAPI Link",
+)
+def links_plan(payload: LinkPlanRequest) -> JSONResponse:
+    try:
+        result = plan_link(
+            payload.document,
+            payload.selector,
+            payload.link,
+            payload.context,
+        )
+    except InvalidLinkDocumentError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_openapi_document",
+                "messages": exc.messages,
+            },
+        )
+    except InvalidLinkSelectorError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_selector", "messages": exc.messages},
+        )
+    except InvalidLinkRequestError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_link_request", "messages": exc.messages},
+        )
+    except LinkPlanningError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "link_planning_failed",
+                "message": (
+                    "the follow-up call could not be planned; fix the "
+                    "reported link target, expressions, parameters or "
+                    "references first"
                 ),
                 "errors": exc.errors,
             },
